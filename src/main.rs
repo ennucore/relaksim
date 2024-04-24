@@ -3,6 +3,13 @@ use plotters::prelude::*;
 use std::error::Error;
 use std::fs::File;
 use std::io::{BufWriter, Write};
+#[macro_use]
+extern crate rustacuda;
+extern crate rustacuda_core;
+
+use rustacuda::prelude::*;
+use rustacuda::memory::{DeviceBuffer, DeviceBox};
+use std::ffi::CString;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let matches = Command::new("Laplace Solver")
@@ -40,39 +47,84 @@ fn initialize_boundary_conditions(scale: usize) -> Vec<Vec<f64>> {
     let mut grid = vec![vec![0.0; 2 * scale]; 2 * scale];
 
     for i in 0..scale {
-        grid[scale][i] = i as f64 / scale as f64;
+        grid[scale][scale + i] = (scale - i) as f64 / scale as f64;
         grid[scale + i][scale] = (scale - i) as f64 / scale as f64;
     }
     grid
 }
 
-fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) {
-    let mut converged = false;
-    while !converged {
-        converged = true;
-        let mut last_row_cached = grid[0].to_vec();
-        let mut last_value_cached = grid[1][0];
-        for i in 1..2 * scale - 1 {
-            let last_row_cached_ = grid[i].to_vec();
-            for j in 1..2 * scale - 1 {
-                if i < scale || j > scale {
-                    let new_v = 0.25
-                        * (grid[i + 1][j]
-                            + last_row_cached[j]
-                            + grid[i][j + 1]
-                            + last_value_cached);
-                    if (new_v - grid[i][j]).abs() > epsilon {
-                        converged = false;
-                    }
-                    grid[i][j] = new_v;
-                }
-                last_value_cached = grid[i][j];
+fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) -> Result<(), Box<dyn Error>> {
+    rustacuda::init(CudaFlags::empty())?;
+    let device = Device::get_device(0)?;
+    let context = Context::create_and_push(ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)?;
+
+    let module_data = CString::new(include_str!("../relaxKernel.ptx"))?;
+    let module = Module::load_from_string(&module_data)?;
+    let stream = Stream::new(StreamFlags::NON_BLOCKING, None)?;
+
+    let width = 2 * scale;
+    let size = width * width;
+
+    // Flatten the grid for GPU processing
+    let mut flat_grid: Vec<f64> = Vec::with_capacity(size);
+    for row in grid.iter() {
+        flat_grid.extend_from_slice(row);
+    }
+
+    let mut grid_dev = std::pin::pin!(DeviceBuffer::from_slice(&flat_grid)?);
+    let mut converged = DeviceBox::new(&false)?;
+    let mut host_grid = vec![0.0f64; size];
+
+    unsafe {
+        let blocks = (width as u32 + 15) / 16;
+        let threads = 16;
+        let mut iterations = 0;
+        let mut pinned = std::pin::pin!(converged);
+
+        loop {
+            pinned.as_mut().set(DeviceBox::new(&true)?);
+
+            launch!(module.relaxKernel<<<(blocks, blocks, 1), (threads, threads, 1), 0, stream>>>(
+                grid_dev.as_device_ptr(),
+                width as i32,
+                scale as i32,
+                epsilon,
+                pinned.as_device_ptr(),
+                size as i32  // Total number of elements
+            ))?;
+
+            stream.synchronize()?;
+
+            let mut host_converged = false;
+            pinned.copy_to(&mut host_converged)?;
+
+            if host_converged {
+                break;
             }
-            last_row_cached = last_row_cached_;
-            last_value_cached = grid[i + 1][0];
+
+            iterations += 1;
+            if iterations > 100000 {
+                println!("Failed to converge after 100000 iterations.");
+                break;
+            }
         }
     }
+
+    // Copy the result back to the host
+    grid_dev.copy_to(&mut host_grid)?;
+
+    // Unflatten the grid back to 2D
+    for (i, row) in grid.iter_mut().enumerate() {
+        let start = i * width;
+        let end = start + width;
+        row.copy_from_slice(&host_grid[start..end]);
+    }
+
+    println!("Grid relaxed.");
+
+    Ok(())
 }
+
 
 fn export_grid(grid: &Vec<Vec<f64>>, file_path: &str) {
     let file = File::create(file_path).unwrap();
