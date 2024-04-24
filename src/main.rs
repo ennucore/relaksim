@@ -47,7 +47,7 @@ fn initialize_boundary_conditions(scale: usize) -> Vec<Vec<f64>> {
     let mut grid = vec![vec![0.0; 2 * scale]; 2 * scale];
 
     for i in 0..scale {
-        grid[scale][scale + i] = (scale - i) as f64 / scale as f64;
+        grid[scale][i] = i as f64 / scale as f64;
         grid[scale + i][scale] = (scale - i) as f64 / scale as f64;
     }
     grid
@@ -55,6 +55,7 @@ fn initialize_boundary_conditions(scale: usize) -> Vec<Vec<f64>> {
 
 fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) -> Result<(), Box<dyn Error>> {
     rustacuda::init(CudaFlags::empty())?;
+    println!("{:?}", grid);
     let device = Device::get_device(0)?;
     let context = Context::create_and_push(ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)?;
 
@@ -73,7 +74,6 @@ fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) -> Resul
 
     let mut grid_dev = std::pin::pin!(DeviceBuffer::from_slice(&flat_grid)?);
     let mut converged = DeviceBox::new(&false)?;
-    let mut host_grid = vec![0.0f64; size];
 
     unsafe {
         let blocks = (width as u32 + 15) / 16;
@@ -82,12 +82,11 @@ fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) -> Resul
         let mut pinned = std::pin::pin!(converged);
 
         loop {
-            pinned.as_mut().set(DeviceBox::new(&true)?);
+            pinned.as_mut().set(DeviceBox::new(&false)?);
 
             launch!(module.relaxKernel<<<(blocks, blocks, 1), (threads, threads, 1), 0, stream>>>(
                 grid_dev.as_device_ptr(),
                 width as i32,
-                scale as i32,
                 epsilon,
                 pinned.as_device_ptr(),
                 size as i32  // Total number of elements
@@ -102,16 +101,19 @@ fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) -> Resul
                 break;
             }
 
+            println!("Iteration done");
             iterations += 1;
-            if iterations > 100000 {
-                println!("Failed to converge after 100000 iterations.");
+            if iterations > 1000 {
+                println!("Failed to converge after 1000 iterations.");
                 break;
             }
         }
     }
 
     // Copy the result back to the host
+    let mut host_grid = vec![0.0f64; size];
     grid_dev.copy_to(&mut host_grid)?;
+    println!("{:?}", host_grid);
 
     // Unflatten the grid back to 2D
     for (i, row) in grid.iter_mut().enumerate() {
@@ -119,6 +121,7 @@ fn relax_potential(grid: &mut [&mut [f64]], scale: usize, epsilon: f64) -> Resul
         let end = start + width;
         row.copy_from_slice(&host_grid[start..end]);
     }
+    println!("{:?}", grid);
 
     println!("Grid relaxed.");
 
